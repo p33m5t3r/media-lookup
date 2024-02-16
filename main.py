@@ -4,9 +4,9 @@ import torch
 import open_clip
 import os
 import chromadb
-from chromadb import Documents, EmbeddingFunction, Embeddings
 from dataclasses import dataclass
 from typing import Any
+import sys
 
 # fuck chromadb, all my homies hate chromadb. just diy it bro.
 # but i'm lazy, so i'll use it for now. 
@@ -28,24 +28,11 @@ def get_clip_cfg():
 
     return ClipConfig(device, model, transform, tokenizer)
 
-CLIP_CFG = get_clip_cfg()
-
 def embed_img(img: Image, clip_cfg: ClipConfig):
     img = img.convert('RGB')
     img = clip_cfg.transform(img).unsqueeze(0).to(clip_cfg.device)
-    n = 20  # truncate/pad to shape (1xn)
     with torch.no_grad(), torch.cuda.amp.autocast():
-        t = clip_cfg.model.generate(img)[0][:n]
-        p = torch.zeros(n)
-        p[:t.shape[0]] = t
-
-    # print(features[0])
-    # print(features.shape)
-    return p 
-
-class ClipEmbeddingFn(EmbeddingFunction):
-    def __call__(self, input: Documents) -> Embeddings:
-        return [embed_img(img, CLIP_CFG) for img in input]
+        return clip_cfg.model.generate(img)
 
 def extract_frames(_dir, filename, sample_rate=1):
     frames = []
@@ -75,70 +62,74 @@ def extract_frames(_dir, filename, sample_rate=1):
     print(f'Extracted {thumb_count} frames from {filename}')
     return frames
 
-def index_video(dir_name, filename, coll):
+def clip_decode(features):
+    return open_clip.decode(features[0]).split("<end_of_text>")[0].replace("<start_of_text>", "")
+
+def index_video(dir_name, filename, coll, ccfg):
     frames = extract_frames(dir_name, filename)
     ids = [frame[0] for frame in frames]
-    # this is all just inefficient hack garbage to get around chromadb
-    # will replace with something else later
-    chroma_hack = lambda t: t.cpu().numpy().tolist()
-    embeddings = [chroma_hack(embed_img(frame[1], CLIP_CFG)) for frame in frames]
+    embeddings = [embed_img(frame[1], ccfg) for frame in frames]
+    docs = [clip_decode(embed) for embed in embeddings]
     coll.add(
-            documents=ids,
+            documents=docs,
             ids=ids,
-            embeddings=embeddings,
         )
 
     print(f'Indexed {filename}')
 
-def index_dir(dir_name: str, coll):
+def index_dir(dir_name: str, coll, ccfg):
     for filename in os.listdir(dir_name):
         if filename.endswith('.mp4'):
             print(f'Indexing {filename}')
-            index_video(dir_name, filename, coll)
+            index_video(dir_name, filename, coll, ccfg)
 
 
-def emb_query(q: str):
-    return CLIP_CFG.tokenizer(q).cpu().numpy().tolist()[0][:20]
+def emb_query(q: str, ccfg):
+    return ccfg.tokenizer(q).cpu().numpy().tolist()[0][:20]
 
-if __name__ == '__main__':
-    
-    # setup / config
-    client = chromadb.Client()
-    embed_fn = ClipEmbeddingFn()
-    collection = client.create_collection(
-        name="video_frames",
-        embedding_function=embed_fn,
-    )
-    MEDIA_ROOT = 'media/'
 
-    # index video frames
+def index(media_root, collection):
+    print("loading model...")
+    CLIP_CFG = get_clip_cfg()
+    index_dir(media_root, collection, CLIP_CFG)
 
-    print(CLIP_CFG.tokenizer("An acoustic guitar.").shape)
-
-    index_dir(MEDIA_ROOT, collection)
-
-    q = "An acoustic guitar."
-    # print(emb_query(q))
+def query(q, collection):
     res = collection.query(
-        query_embeddings=emb_query(q),
-        include=['documents']
+        query_texts=[q],
+        n_results=1,
     )
 
-    print(res)
+    return res['ids'][0][0]
 
 
-    """
+# https://colab.research.google.com/github/mlfoundations/open_clip/blob/master/docs/Interacting_with_open_coca.ipynb
+if __name__ == '__main__':
+        # setup / config
+    VDB_PATH = 'vectordb'
     MEDIA_ROOT = 'media/'
-    filename = 'video.mp4'
-    extract_frames(MEDIA_ROOT, filename, sample_rate=1)
-    
-    print(open_clip.decode(features[0]).split("<end_of_text>")[0].replace("<start_of_text>", ""))
-    print(features)
-    print(features.shape)
 
-    test_txt = "An acoustic guitar."
-    print(tokenizer(test_txt).to(device))
-    # image_features /= image_features.norm(dim=-1, keepdim=True)
-    """
+    client = chromadb.PersistentClient(path=VDB_PATH)
+    collection = client.get_or_create_collection(
+        name="video_frames",
+    )
 
+    args = sys.argv[1:]
+    if len(args) >= 1:
+        if args[0] == 'index':
+            index(MEDIA_ROOT, collection)
+        elif args[0] == 'find':
+            q = args[1]
+            exit(0)
+            print(f'searching for: \"{q}\"')
+
+            n_results = 3
+            res = collection.query(
+                query_texts=[q],
+                n_results=n_results,
+            )
+            print("\nresults:")
+            for r in range(n_results):
+                _id = res['ids'][0][r]
+                _doc = res['documents'][0][r]
+                print(f'  {_id} - \"{_doc}\"')
 
